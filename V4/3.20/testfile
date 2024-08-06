@@ -1,0 +1,314 @@
+import os
+import time
+import logging
+import subprocess
+import tkinter as tk
+from tkinter import ttk, messagebox
+from datetime import datetime, timedelta
+from logging.handlers import TimedRotatingFileHandler
+import json
+from twilio.rest import Client
+from threading import Thread
+import win32com.client
+import pythoncom
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Define logger
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        log_record = {
+            'timestamp': self.formatTime(record, self.datefmt),
+            'level': record.levelname,
+            'message': record.getMessage(),
+            'name': record.name,
+            'filename': record.pathname,
+            'lineno': record.lineno
+        }
+        return json.dumps(log_record)
+
+logger = logging.getLogger('url-monitor')
+logger.setLevel(logging.DEBUG)
+handler = TimedRotatingFileHandler('url-monitor.log', when='midnight', interval=1)
+handler.suffix = "%Y%m%d"
+handler.setLevel(logging.DEBUG)
+formatter = JsonFormatter()
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+app_logger = logging.getLogger('app-log')
+app_logger.setLevel(logging.DEBUG)
+app_handler = TimedRotatingFileHandler('app.log', when='midnight', interval=1)
+app_handler.suffix = "%Y%m%d"
+app_handler.setLevel(logging.DEBUG)
+app_formatter = JsonFormatter()
+app_handler.setFormatter(app_formatter)
+app_logger.addHandler(app_handler)
+
+# Global variables for Twilio and monitoring
+twilio_client = None
+twilio_details = {
+    'account_sid': '',
+    'auth_token': '',
+    'twilio_number': '',
+    'recipient_numbers': [],
+    'twiml_bin_url': ''
+}
+urls_to_monitor = []
+monitoring_active = True
+silence_period = None
+mail_check_enabled = False
+mail_labels = {}
+evaluation_interval = 300  # Default to 5 minutes
+
+def send_call_alert(url):
+    try:
+        for number in twilio_details['recipient_numbers']:
+            call = twilio_client.calls.create(
+                to=number,
+                from_=twilio_details['twilio_number'],
+                url=twilio_details['twiml_bin_url']  # Use the TwiML Bin URL from Twilio details
+            )
+            logger.info(f"Call alert sent to {number} for URL: {url}")
+    except Exception as e:
+        logger.error(f"Failed to send call alert: {e}")
+
+def check_url(url):
+    try:
+        response = subprocess.run(['ping', '-n', '1', url], capture_output=True, text=True)
+        if response.returncode == 0:
+            logger.info(f"URL {url} is reachable.")
+            return True
+        else:
+            logger.error(f"URL {url} is not reachable.")
+            return False
+    except Exception as e:
+        logger.error(f"Failed to check URL {url}: {e}")
+        return False
+
+def monitor_urls():
+    while monitoring_active:
+        for url in urls_to_monitor:
+            current_time = datetime.utcnow()
+            if silence_period and silence_period[0] <= current_time <= silence_period[1]:
+                status_label.config(text=f"{url}: Monitoring (Silenced)")
+                continue
+
+            status = check_url(url)
+            status_label.config(text=f"{url}: {'Reachable' if status else 'Not Reachable'}")
+
+            if not status:
+                time.sleep(5 * 60)  # 5 minutes
+                if not check_url(url):
+                    send_call_alert(url)
+                    
+        time.sleep(evaluation_interval)
+
+def start_monitoring():
+    global monitoring_thread
+    monitoring_thread = Thread(target=monitor_urls)
+    monitoring_thread.daemon = True
+    monitoring_thread.start()
+    app_logger.info("Monitoring started.")
+
+def stop_monitoring():
+    global monitoring_active
+    monitoring_active = False
+    app_logger.info("Monitoring stopped.")
+    messagebox.showinfo("Stopped", "Monitoring stopped.")
+
+def check_mailbox():
+    pythoncom.CoInitialize()  # Initialize COM library
+    try:
+        outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+        inbox = outlook.GetDefaultFolder(6)  # 6 refers to the inbox
+
+        current_time = datetime.utcnow()
+        five_minutes_ago = current_time - timedelta(minutes=5)
+
+        for message in inbox.Items:
+            received_time = message.ReceivedTime
+            if received_time >= five_minutes_ago and received_time <= current_time:
+                subject = message.Subject.lower()
+                body = message.Body.lower()
+
+                for label, value in mail_labels.items():
+                    if label.lower() in subject and value.lower() in body:
+                        for number in twilio_details['recipient_numbers']:
+                            send_call_alert(f"Email alert: {label} - {value}")
+                        break
+    except Exception as e:
+        logger.error(f"Failed to check mailbox: {e}")
+    finally:
+        pythoncom.CoUninitialize()  # Uninitialize COM library
+
+def monitor_mailbox():
+    while monitoring_active and mail_check_enabled:
+        check_mailbox()
+        time.sleep(300)  # Check every 5 minutes
+
+def start_mail_monitoring():
+    global mail_monitoring_thread
+    mail_monitoring_thread = Thread(target=monitor_mailbox)
+    mail_monitoring_thread.daemon = True
+    mail_monitoring_thread.start()
+    app_logger.info("Mailbox monitoring started.")
+
+def save_and_start_monitoring():
+    global twilio_client, mail_check_enabled, mail_labels, evaluation_interval
+    try:
+        twilio_details['account_sid'] = account_sid_entry.get().strip() or None
+        twilio_details['auth_token'] = auth_token_entry.get().strip() or None
+        twilio_details['twilio_number'] = twilio_number_entry.get().strip() or None
+        recipient_numbers = recipient_numbers_entry.get().split(',')
+        twilio_details['recipient_numbers'] = [num.strip() for num in recipient_numbers if num.strip()]
+        twilio_details['twiml_bin_url'] = twiml_bin_url_entry.get().strip() or None
+
+        # Ensure none of the required details are None
+        if not all([twilio_details['account_sid'], twilio_details['auth_token'], twilio_details['twilio_number'], twilio_details['twiml_bin_url']]):
+            raise ValueError("Twilio details are incomplete. Please fill in all the required fields.")
+
+        # Initialize Twilio client
+        twilio_client = Client(twilio_details['account_sid'], twilio_details['auth_token'])
+
+        urls = [url.strip() for url in urls_entry.get().split(',')]
+        if not urls:
+            raise ValueError("URLs list is empty. Please provide at least one URL.")
+
+        evaluation_interval = int(evaluation_interval_entry.get().strip()) * 60  # Convert minutes to seconds
+
+        if 1 <= len(urls) <= 50 and 1 <= len(twilio_details['recipient_numbers']) <= 10:
+            urls_to_monitor.extend(urls)
+            monitoring_active = True
+            start_monitoring()
+            if mail_check_var.get() == 1:
+                mail_check_enabled = True
+                mail_labels = dict(item.split(':') for item in mail_labels_entry.get().split(',') if ':' in item)
+                start_mail_monitoring()
+            save_configuration()
+            messagebox.showinfo("Success", "Monitoring started.")
+        else:
+            raise ValueError("Invalid input. Please check the limits.")
+    except ValueError as e:
+        logger.error(f"Value error: {e}")
+        messagebox.showerror("Error", str(e))
+    except Exception as e:
+        logger.error(f"Unhandled exception: {e}")
+        messagebox.showerror("Error", f"Failed to start monitoring: {e}")
+
+def set_silence_period():
+    start_time_str = silence_start_entry.get()
+    end_time_str = silence_end_entry.get()
+    try:
+        start_time = datetime.strptime(start_time_str, '%H:%M').time()
+        end_time = datetime.strptime(end_time_str, '%H:%M').time()
+
+        now = datetime.utcnow()
+        silence_start = datetime.combine(now, start_time)
+        silence_end = datetime.combine(now, end_time)
+        if silence_start > silence_end:
+            silence_end += timedelta(days=1)
+        global silence_period
+        silence_period = (silence_start, silence_end)
+        app_logger.info(f"Silence period set from {silence_start} to {silence_end}.")
+        messagebox.showinfo("Silence Period Set", "Silence period set successfully.")
+    except ValueError:
+        app_logger.error("Invalid time format entered for silence period.")
+        messagebox.showerror("Error", "Invalid time format. Please use HH:MM format.")
+
+def save_configuration():
+    configuration = {
+        'twilio_details': twilio_details,
+        'urls_to_monitor': urls_to_monitor,
+        'mail_check_enabled': mail_check_enabled,
+        'mail_labels': mail_labels,
+        'evaluation_interval': evaluation_interval // 60
+    }
+    with open('config.json', 'w') as config_file:
+        json.dump(configuration, config_file, indent=4)
+    app_logger.info("Configuration saved successfully.")
+
+def load_configuration():
+    global twilio_details, urls_to_monitor, mail_check_enabled, mail_labels, evaluation_interval
+    try:
+        with open('config.json', 'r') as config_file:
+            configuration = json.load(config_file)
+            twilio_details = configuration.get('twilio_details', {})
+            urls_to_monitor = configuration.get('urls_to_monitor', [])
+            mail_check_enabled = configuration.get('mail_check_enabled', False)
+            mail_labels = configuration.get('mail_labels', {})
+            evaluation_interval = configuration.get('evaluation_interval', 5) * 60
+    except FileNotFoundError:
+        app_logger.warning("Configuration file not found. Loading defaults.")
+    except json.JSONDecodeError as e:
+        app_logger.error(f"Failed to parse configuration file: {e}")
+
+# Initialize the GUI application
+root = tk.Tk()
+root.title("URL Monitor and Alert System")
+
+frame = ttk.Frame(root, padding="10")
+frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+# Twilio account details
+ttk.Label(frame, text="Twilio Account SID").grid(row=0, column=0, sticky=tk.W)
+account_sid_entry = ttk.Entry(frame, width=40)
+account_sid_entry.grid(row=0, column=1, sticky=(tk.W, tk.E))
+
+ttk.Label(frame, text="Twilio Auth Token").grid(row=1, column=0, sticky=tk.W)
+auth_token_entry = ttk.Entry(frame, width=40, show="*")
+auth_token_entry.grid(row=1, column=1, sticky=(tk.W, tk.E))
+
+ttk.Label(frame, text="Twilio Number").grid(row=2, column=0, sticky=tk.W)
+twilio_number_entry = ttk.Entry(frame, width=40)
+twilio_number_entry.grid(row=2, column=1, sticky=(tk.W, tk.E))
+
+ttk.Label(frame, text="Recipient Numbers (comma-separated)").grid(row=3, column=0, sticky=tk.W)
+recipient_numbers_entry = ttk.Entry(frame, width=40)
+recipient_numbers_entry.grid(row=3, column=1, sticky=(tk.W, tk.E))
+
+ttk.Label(frame, text="TwiML Bin URL").grid(row=4, column=0, sticky=tk.W)
+twiml_bin_url_entry = ttk.Entry(frame, width=40)
+twiml_bin_url_entry.grid(row=4, column=1, sticky=(tk.W, tk.E))
+
+# URL monitoring details
+ttk.Label(frame, text="URLs to Monitor (comma-separated)").grid(row=5, column=0, sticky=tk.W)
+urls_entry = ttk.Entry(frame, width=40)
+urls_entry.grid(row=5, column=1, sticky=(tk.W, tk.E))
+
+ttk.Label(frame, text="Evaluation Interval (minutes)").grid(row=6, column=0, sticky=tk.W)
+evaluation_interval_entry = ttk.Entry(frame, width=40)
+evaluation_interval_entry.grid(row=6, column=1, sticky=(tk.W, tk.E))
+
+# Silence period settings
+ttk.Label(frame, text="Silence Period Start (HH:MM)").grid(row=7, column=0, sticky=tk.W)
+silence_start_entry = ttk.Entry(frame, width=40)
+silence_start_entry.grid(row=7, column=1, sticky=(tk.W, tk.E))
+
+ttk.Label(frame, text="Silence Period End (HH:MM)").grid(row=8, column=0, sticky=tk.W)
+silence_end_entry = ttk.Entry(frame, width=40)
+silence_end_entry.grid(row=8, column=1, sticky=(tk.W, tk.E))
+
+# Mailbox monitoring settings
+mail_check_var = tk.IntVar()
+ttk.Checkbutton(frame, text="Enable Mailbox Check", variable=mail_check_var).grid(row=9, column=0, columnspan=2, sticky=tk.W)
+
+ttk.Label(frame, text="Mail Labels to Check (label:value)").grid(row=10, column=0, sticky=tk.W)
+mail_labels_entry = ttk.Entry(frame, width=40)
+mail_labels_entry.grid(row=10, column=1, sticky=(tk.W, tk.E))
+
+# Status label
+status_label = ttk.Label(frame, text="Status: Idle")
+status_label.grid(row=11, column=0, columnspan=2, sticky=(tk.W, tk.E))
+
+# Buttons
+ttk.Button(frame, text="Start Monitoring", command=save_and_start_monitoring).grid(row=12, column=0, sticky=tk.W)
+ttk.Button(frame, text="Stop Monitoring", command=stop_monitoring).grid(row=12, column=1, sticky=tk.E)
+
+ttk.Button(frame, text="Set Silence Period", command=set_silence_period).grid(row=13, column=0, columnspan=2, sticky=(tk.W, tk.E))
+
+load_configuration()  # Load previous configuration if available
+
+root.mainloop()
