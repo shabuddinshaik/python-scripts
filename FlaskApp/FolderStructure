@@ -1,0 +1,25 @@
+monitoring-app/
+├── backend/
+│   ├── app.py
+│   ├── config.py
+│   ├── utils/
+│   │   ├── monitor.py
+│   │   ├── outlook.py
+│   │   └── __init__.py
+│   ├── requirements.txt
+│   ├── setup.py
+│   ├── wsgi.py
+├── frontend/
+│   ├── MonitoringUI.sln
+│   ├── MonitoringUI/
+│   │   ├── Program.cs
+│   │   ├── MainForm.cs
+│   │   ├── MainForm.Designer.cs
+│   │   ├── MainForm.resx
+│   │   └── Properties/
+│   │       ├── AssemblyInfo.cs
+│   ├── bin/
+│       ├── Debug/
+│       └── Release/
+├── README.md
+└── .gitignore
